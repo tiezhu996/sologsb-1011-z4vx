@@ -2,6 +2,28 @@ export type ConnectionState = 'connected' | 'degraded' | 'offline';
 export type SegmentState = 'pending' | 'confirmed' | 'duplicate' | 'stale' | 'ignored';
 export type SegmentSource = 'live' | 'offline' | 'manual';
 
+export type ErratumStatus = 'active' | 'revoked';
+
+export interface ErratumRecord {
+  previousText: string;
+  note: string;
+  correctedText: string;
+  submittedAt: number;
+  status: ErratumStatus;
+  revokedAt?: number;
+  revokeReason?: string;
+}
+
+export interface ErratumLogEntry {
+  action: 'submit' | 'revoke';
+  previousText: string;
+  note: string;
+  correctedText: string;
+  submittedAt: number;
+  revokedAt?: number;
+  revokeReason?: string;
+}
+
 export interface CaptionSegment {
   id: string;
   sequence: number;
@@ -18,6 +40,8 @@ export interface CaptionSegment {
   staleReason?: string;
   revision: number;
   tags: string[];
+  erratum?: ErratumRecord;
+  errataLog: ErratumLogEntry[];
 }
 
 export interface TermRule {
@@ -79,6 +103,7 @@ function segment(
     state,
     revision: 0,
     tags: [],
+    errataLog: [],
   };
 }
 
@@ -100,10 +125,30 @@ const duplicate: CaptionSegment = {
 };
 
 export function createInitialModel(): DeskModel {
+  const demoErratumAt = now - 5 * 60_000;
+  const seeded = seededSegments.map((item) => item.id === 'seg-1'
+    ? {
+        ...item,
+        erratum: {
+          previousText: item.corrected,
+          note: '直播口播为“二〇二五”，识别成了“二〇二六”，回放已按更正文本核对。',
+          correctedText: '欢迎大家来到2025年产品发布会。',
+          submittedAt: demoErratumAt,
+          status: 'active' as const,
+        },
+        errataLog: [{
+          action: 'submit' as const,
+          previousText: item.corrected,
+          note: '直播口播为“二〇二五”，识别成了“二〇二六”，回放与直播不一致。',
+          correctedText: '欢迎大家来到2025年产品发布会。',
+          submittedAt: demoErratumAt,
+        }],
+      }
+    : item);
   return {
     eventName: '新品发布会现场字幕',
     eventDate: new Date(now).toISOString().slice(0, 10),
-    segments: [...seededSegments, duplicate],
+    segments: [...seeded, duplicate],
     rules: [
       { id: 'term-1', source: 'co pilot', replacement: 'Co-Pilot', speaker: '', enabled: true, caseSensitive: false, usageCount: 4, createdAt: now - 86_400_000 },
       { id: 'term-2', source: 'studio cloud', replacement: 'Studio Cloud', speaker: '', enabled: true, caseSensitive: false, usageCount: 7, createdAt: now - 43_200_000 },
@@ -260,6 +305,7 @@ export function createLiveSegment(sequence: number): CaptionSegment {
     state: 'pending',
     revision: 0,
     tags: [],
+    errataLog: [],
   };
 }
 
@@ -290,7 +336,15 @@ export function simulateLatency(model: DeskModel): DeskModel {
   };
 }
 
-export function toSrt(model: DeskModel): string {
+export function liveText(segment: CaptionSegment): string {
+  return segment.erratum?.status === 'active' ? segment.erratum.correctedText : segment.corrected;
+}
+
+export function activeErrataCount(model: DeskModel): number {
+  return model.segments.filter((item) => item.state === 'confirmed' && item.erratum?.status === 'active').length;
+}
+
+export function buildSrt(model: DeskModel): { content: string; count: number; errata: number } {
   const stamp = (seconds: number, separator = ',') => {
     const hours = Math.floor(seconds / 3600);
     const minutes = Math.floor((seconds % 3600) / 60);
@@ -298,9 +352,11 @@ export function toSrt(model: DeskModel): string {
     const millis = Math.round((seconds - Math.floor(seconds)) * 1000);
     return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}${separator}${String(millis).padStart(3, '0')}`;
   };
-  return model.segments
+  const confirmed = model.segments
     .filter((item) => item.state === 'confirmed')
-    .sort((a, b) => a.startTime - b.startTime)
-    .map((item, index) => `${index + 1}\n${stamp(item.startTime)} --> ${stamp(item.startTime + 7)}\n[${item.speaker}] ${item.corrected}\n`)
+    .sort((a, b) => a.startTime - b.startTime);
+  const content = confirmed
+    .map((item, index) => `${index + 1}\n${stamp(item.startTime)} --> ${stamp(item.startTime + 7)}\n[${item.speaker}] ${liveText(item)}\n`)
     .join('\n');
+  return { content, count: confirmed.length, errata: confirmed.filter((item) => item.erratum?.status === 'active').length };
 }

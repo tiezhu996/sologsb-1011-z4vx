@@ -2,17 +2,19 @@ import { LitElement, css, html, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import {
   applyRules,
+  buildSrt,
   cloneModel,
   createInitialModel,
+  liveText,
   mergeConfirmedSegments,
   normalizeNumbers,
   queueStats,
   STORAGE_KEY,
   simulateLatency,
-  toSrt,
   type CaptionSegment,
   type ConnectionState,
   type DeskModel,
+  type ErratumLogEntry,
   type SegmentState,
   type ToastMessage,
 } from './model';
@@ -23,6 +25,17 @@ function formatClock(seconds: number): string {
   const minutes = Math.floor(seconds / 60);
   const rest = Math.floor(seconds % 60);
   return `${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`;
+}
+
+function formatDateTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
 }
 
 function formatAge(timestamp: number): string {
@@ -218,6 +231,36 @@ export class CaptionDesk extends LitElement {
     .live-item small { display: block; margin-top: 4px; color: var(--cds-text-secondary, #525252); font-size: 9px; }
     .delivery-status { margin: 0 10px 10px; padding: 9px 10px; background: #edf5ff; border-left: 3px solid #0f62fe; color: #0043ce; font-size: 10px; line-height: 1.45; }
 
+    .live-item.erratum { border-left-color: #da1e28; background: color-mix(in srgb, var(--cds-layer-02, #f4f4f4) 92%, #da1e28 8%); }
+    .live-item.revoked { opacity: .85; }
+    .live-item.draft { outline: 1px solid #da1e28; outline-offset: -1px; }
+    .erratum-badge { margin: 4px 0 0; }
+    .live-corrected { margin: 5px 0 0; color: #a2191f; font-weight: 500; }
+    .live-previous { margin: 4px 0 0; padding-left: 8px; border-left: 2px solid #da1e28; color: var(--cds-text-secondary, #525252); font-size: calc(var(--caption-font-size) * .8); line-height: 1.4; text-decoration: line-through; text-decoration-color: color-mix(in srgb, currentColor 55%, transparent); }
+    .live-previous span, .revoke-note { display: inline-block; text-decoration: none; margin-right: 4px; font-size: 9px; color: #a2191f; }
+    .revoke-note { color: var(--cds-text-secondary, #525252); }
+    .live-actions { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+    .live-actions small { color: var(--cds-text-secondary, #525252); font-size: 9px; }
+
+    .erratum-editor { margin: 8px 10px 4px; padding: 11px 12px; display: flex; flex-direction: column; gap: 10px; background: var(--cds-layer-02, #f4f4f4); border: 1px solid #da1e28; }
+    .erratum-editor-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .erratum-editor-head strong { font-size: 12px; color: #a2191f; }
+    .erratum-broadcast { padding: 7px 9px; background: var(--cds-layer, #fff); border-left: 2px solid #8d8d8d; font-size: 11px; line-height: 1.5; }
+    .erratum-broadcast.current { border-left-color: #da1e28; color: #a2191f; }
+    .erratum-broadcast span { display: block; margin-bottom: 2px; color: var(--cds-text-secondary, #525252); font-size: 9px; }
+    .erratum-editor-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+    .erratum-editor-actions small { flex: 1; color: var(--cds-text-secondary, #525252); font-size: 10px; }
+    .erratum-revoke { padding-top: 9px; border-top: 1px dashed var(--cds-border-strong, #8d8d8d); display: flex; flex-direction: column; gap: 8px; }
+    .erratum-log { display: flex; flex-direction: column; gap: 6px; }
+    .erratum-log > span { color: var(--cds-text-secondary, #525252); font-size: 10px; }
+    .erratum-log-entry { padding: 7px 9px; background: var(--cds-layer, #fff); border-left: 2px solid #da1e28; font-size: 10px; line-height: 1.5; }
+    .erratum-log-entry.revoke { border-left-color: #8d8d8d; }
+    .erratum-log-entry strong { font-size: 10px; color: #a2191f; }
+    .erratum-log-entry.revoke strong { color: var(--cds-text-secondary, #525252); }
+    .erratum-log-entry time { float: right; color: var(--cds-text-secondary, #525252); font: 500 9px/1.4 "IBM Plex Mono", monospace; }
+    .erratum-log-entry p { margin: 3px 0 0; }
+    .erratum-log-entry em { font-style: normal; color: var(--cds-text-secondary, #525252); margin-right: 2px; }
+
     .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 20; width: 380px; display: flex; flex-direction: column; gap: 8px; }
     cds-toast-notification { box-shadow: 0 8px 22px rgba(0,0,0,.18); }
 
@@ -246,6 +289,10 @@ export class CaptionDesk extends LitElement {
   @state() private ruleSpeaker = '';
   @state() private filter: 'active' | 'all' | 'attention' = 'active';
   @state() private showRuleForm = false;
+  @state() private erratumDraftId?: string;
+  @state() private erratumText = '';
+  @state() private erratumNote = '';
+  @state() private erratumRevokeReason = '';
   private past: DeskModel[] = [];
   private future: DeskModel[] = [];
   private ticker?: number;
@@ -273,7 +320,10 @@ export class CaptionDesk extends LitElement {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw) as DeskModel;
-        if (parsed.segments?.length) return parsed;
+        if (parsed.segments?.length) {
+          parsed.segments = parsed.segments.map((item) => (item.errataLog ? item : { ...item, errataLog: [] }));
+          return parsed;
+        }
       }
     } catch {
       // 损坏草稿会回退到演示数据。
@@ -534,8 +584,88 @@ export class CaptionDesk extends LitElement {
     this.commit('删除术语规则', (current) => ({ ...current, rules: current.rules.filter((item) => item.id !== id) }));
   }
 
+  private get erratumSegment(): CaptionSegment | undefined {
+    return this.erratumDraftId ? this.model.segments.find((item) => item.id === this.erratumDraftId) : undefined;
+  }
+
+  private openErratum(segment: CaptionSegment): void {
+    if (segment.source === 'offline') {
+      this.pushToast('warning', '离线片段暂不能勘误', '请先在恢复连接后完成合并，再对直播区片段提交勘误');
+      return;
+    }
+    const active = segment.erratum?.status === 'active' ? segment.erratum : undefined;
+    this.erratumDraftId = segment.id;
+    this.erratumText = active?.correctedText ?? liveText(segment);
+    this.erratumNote = active?.note ?? '';
+    this.erratumRevokeReason = '';
+  }
+
+  private closeErratum(): void {
+    this.erratumDraftId = undefined;
+    this.erratumText = '';
+    this.erratumNote = '';
+    this.erratumRevokeReason = '';
+  }
+
+  private submitErratum(): void {
+    const target = this.erratumSegment;
+    if (!target) return this.closeErratum();
+    const correctedText = this.erratumText.trim();
+    const note = this.erratumNote.trim();
+    if (!correctedText) {
+      this.pushToast('warning', '勘误文本为空', '请填写更正后的新文本');
+      return;
+    }
+    if (!note) {
+      this.pushToast('warning', '缺少更正说明', '请写明为什么要更正，例如识别错误、口误或数字有误');
+      return;
+    }
+    const submittedAt = Date.now();
+    this.commit('提交直播勘误', (current) => ({
+      ...current,
+      segments: current.segments.map((item) => {
+        if (item.id !== target.id) return item;
+        const previousText = liveText(item);
+        const record = { previousText, note, correctedText, submittedAt, status: 'active' as const };
+        const logEntry: ErratumLogEntry = { action: 'submit', previousText, note, correctedText, submittedAt };
+        return { ...item, erratum: record, errataLog: [...item.errataLog, logEntry] };
+      }),
+    }));
+    this.pushToast('success', `第 ${target.sequence} 段勘误已记录`, '直播区已标出勘误，导出 SRT 将使用更正后的文本');
+    this.closeErratum();
+  }
+
+  private revokeErratum(): void {
+    const target = this.erratumSegment;
+    if (!target || target.erratum?.status !== 'active') return;
+    const revokedAt = Date.now();
+    const revokeReason = this.erratumRevokeReason.trim() || '校对员手动撤销';
+    this.commit('撤销直播勘误', (current) => ({
+      ...current,
+      segments: current.segments.map((item) => {
+        if (item.id !== target.id || item.erratum?.status !== 'active') return item;
+        const logEntry: ErratumLogEntry = {
+          action: 'revoke',
+          previousText: item.erratum.previousText,
+          note: item.erratum.note,
+          correctedText: item.erratum.correctedText,
+          submittedAt: item.erratum.submittedAt,
+          revokedAt,
+          revokeReason,
+        };
+        return {
+          ...item,
+          erratum: { ...item.erratum, status: 'revoked', revokedAt, revokeReason },
+          errataLog: [...item.errataLog, logEntry],
+        };
+      }),
+    }));
+    this.pushToast('success', `第 ${target.sequence} 段勘误已撤销`, '直播恢复使用改前内容，撤销操作已留在勘误记录中');
+    this.closeErratum();
+  }
+
   private exportSrt(): void {
-    const content = toSrt(this.model);
+    const { content, count, errata } = buildSrt(this.model);
     if (!content) {
       this.pushToast('warning', '暂无已确认字幕', '先确认至少一个片段再导出');
       return;
@@ -547,7 +677,11 @@ export class CaptionDesk extends LitElement {
     anchor.download = `${this.model.eventName.replace(/[^\p{L}\p{N}-]+/gu, '-')}.srt`;
     anchor.click();
     URL.revokeObjectURL(url);
-    this.pushToast('success', 'SRT 已导出', `${toSrt(this.model).split('\n\n').length} 段字幕`);
+    this.pushToast(
+      'success',
+      'SRT 已导出',
+      `共 ${count} 段字幕，本场带出 ${errata} 处勘误，导出文本以最新更正为准`,
+    );
   }
 
   private adjustFont(delta: number): void {
@@ -693,9 +827,73 @@ export class CaptionDesk extends LitElement {
     `;
   }
 
+  private renderErratumEditor() {
+    const target = this.erratumSegment;
+    if (!target) return nothing;
+    const active = target.erratum?.status === 'active' ? target.erratum : undefined;
+    const mode = active ? 're-edit' : 'create';
+    return html`
+      <div class="erratum-editor">
+        <div class="erratum-editor-head">
+          <strong>${mode === 'create' ? `对第 ${target.sequence} 段提交勘误` : `更新第 ${target.sequence} 段的勘误`}</strong>
+          <cds-button kind="ghost" size="sm" @click=${this.closeErratum}>收起</cds-button>
+        </div>
+        <div class="erratum-broadcast"><span>直播区原文</span>${target.corrected}</div>
+        ${active ? html`
+          <div class="erratum-broadcast current"><span>当前更正（提交于 ${formatDateTime(active.submittedAt)}）</span>${active.correctedText}</div>
+        ` : nothing}
+        <cds-textarea
+          label-text="更正后的新文本"
+          helper-text="导出字幕会使用这里的文本；同一片段再次提交只保留最近一次"
+          .value=${this.erratumText}
+          @input=${(event: Event) => { this.erratumText = (event.currentTarget as any).value; }}
+        ></cds-textarea>
+        <cds-textarea
+          label-text="更正说明"
+          helper-text="写明错在哪里、依据是什么，将与原文和提交时间一起留在勘误记录中"
+          .value=${this.erratumNote}
+          @input=${(event: Event) => { this.erratumNote = (event.currentTarget as any).value; }}
+        ></cds-textarea>
+        <div class="erratum-editor-actions">
+          <cds-button kind="secondary" size="sm" @click=${this.closeErratum}>取消</cds-button>
+          <cds-button kind="primary" size="sm" @click=${this.submitErratum}>${mode === 'create' ? '提交勘误' : '再次提交勘误'}</cds-button>
+        </div>
+        ${active ? html`
+          <div class="erratum-revoke">
+            <cds-text-input
+              label-text="撤销原因（可空）"
+              .value=${this.erratumRevokeReason}
+              @input=${(event: Event) => { this.erratumRevokeReason = (event.currentTarget as any).value; }}
+            ></cds-text-input>
+            <div class="erratum-editor-actions">
+              <small>撤销后直播区恢复改前内容，撤销同样会写入勘误记录。</small>
+              <cds-button kind="danger--tertiary" size="sm" @click=${this.revokeErratum}>撤销这条勘误</cds-button>
+            </div>
+          </div>
+        ` : nothing}
+        ${target.errataLog.length ? html`
+          <div class="erratum-log">
+            <span>勘误记录 · 共 ${target.errataLog.length} 条</span>
+            ${[...target.errataLog].reverse().map((entry, index) => html`
+              <div class="erratum-log-entry ${entry.action}">
+                <strong>${entry.action === 'submit' ? (index === 0 && target.erratum?.status === 'active' ? '最近一次提交' : '提交勘误') : '撤销勘误'}</strong>
+                <time>${formatDateTime(entry.action === 'revoke' ? (entry.revokedAt ?? entry.submittedAt) : entry.submittedAt)}</time>
+                <p><em>改前：</em>${entry.previousText}</p>
+                <p><em>更正：</em>${entry.correctedText}</p>
+                <p><em>说明：</em>${entry.note}</p>
+                ${entry.action === 'revoke' ? html`<p><em>撤销原因：</em>${entry.revokeReason || '未填写'}</p>` : nothing}
+              </div>
+            `)}
+          </div>
+        ` : nothing}
+      </div>
+    `;
+  }
+
   private renderInspector() {
     const item = this.selected;
     const confirmed = this.model.segments.filter((segment) => segment.state === 'confirmed').sort((a, b) => a.startTime - b.startTime);
+    const activeErrata = confirmed.filter((segment) => segment.erratum?.status === 'active').length;
     return html`
       <div class="inspector">
         <section class="inspector-section">
@@ -732,18 +930,37 @@ export class CaptionDesk extends LitElement {
         <section class="inspector-section">
           <div class="inspector-section-head">
             <h3>直播区时间线</h3>
-            <span>${confirmed.length} 段已确认</span>
+            <span>${confirmed.length} 段已确认 · ${activeErrata} 处已勘误</span>
           </div>
+          ${this.renderErratumEditor()}
           <div class="live-timeline">
-            ${confirmed.length ? confirmed.slice(-12).reverse().map((segment) => html`
-              <article class="live-item">
+            ${confirmed.length ? confirmed.slice(-12).reverse().map((segment) => {
+              const active = segment.erratum?.status === 'active' ? segment.erratum : undefined;
+              const revoked = segment.erratum?.status === 'revoked' ? segment.erratum : undefined;
+              const isDraft = segment.id === this.erratumDraftId;
+              return html`
+              <article class="live-item ${active ? 'erratum' : revoked ? 'revoked' : ''} ${isDraft ? 'draft' : ''}">
                 <time>${formatClock(segment.startTime)} · ${segment.speaker}</time>
-                <p>${segment.corrected}</p>
+                ${active ? html`
+                  <cds-tag class="erratum-badge" type="red" size="sm">已勘误</cds-tag>
+                  <p class="live-corrected">${active.correctedText}</p>
+                  <p class="live-previous"><span>改前</span>${active.previousText}</p>
+                  <small>勘误于 ${formatDateTime(active.submittedAt)} · ${active.note}</small>
+                ` : html`
+                  <p>${liveText(segment)}</p>
+                  ${revoked ? html`<small class="revoke-note">勘误已于 ${formatDateTime(revoked.revokedAt ?? revoked.submittedAt)} 撤销（${revoked.revokeReason || '未填写原因'}），直播恢复改前内容</small>` : nothing}
+                `}
                 ${segment.source === 'offline' ? html`<small>离线来源 · 恢复后合并</small>` : nothing}
+                <div class="live-actions">
+                  <cds-button kind="ghost" size="sm" ?disabled=${segment.source === 'offline'} @click=${() => this.openErratum(segment)}>
+                    ${active ? '更新 / 撤销勘误' : '提交勘误'}
+                  </cds-button>
+                  ${segment.errataLog.length ? html`<small>${segment.errataLog.filter((entry) => entry.action === 'submit').length} 次提交 · ${segment.errataLog.filter((entry) => entry.action === 'revoke').length} 次撤销</small>` : nothing}
+                </div>
               </article>
-            `) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
+            `;}) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
           </div>
-          ${this.stats.offline > 0 ? html`<div class="delivery-status">离线发件箱有 ${this.stats.offline} 段待合并。恢复连接后按时间顺序提交，不会覆盖已确认内容。</div>` : nothing}
+          ${this.stats.offline > 0 ? html`<div class="delivery-status">离线发件箱有 ${this.stats.offline} 段待合并。恢复连接后按时间顺序提交，不会覆盖已确认内容；合并后才能对这些片段勘误。</div>` : nothing}
         </section>
 
         <section class="inspector-section">
@@ -755,6 +972,12 @@ export class CaptionDesk extends LitElement {
             ${item ? html`
               <div><strong>原始字幕：</strong>${item.original}</div>
               <div style="margin-top: 8px;"><strong>修改前校正：</strong>${item.corrected}</div>
+              ${item.erratum ? html`
+                <div style="margin-top: 8px; color: ${item.erratum.status === 'active' ? '#a2191f' : 'var(--cds-text-secondary)'};">
+                  <strong>勘误状态：</strong>${item.erratum.status === 'active' ? '已勘误（导出生效）' : '勘误已撤销'}
+                  · 记录 ${item.errataLog.length} 条
+                </div>
+              ` : nothing}
               <div style="margin-top: 8px; color: var(--cds-text-secondary);">${item.tags.length ? `标签：${item.tags.join('、')}` : '尚未应用术语标签'}</div>
             ` : html`<span>请选择片段以查看上下文。</span>`}
           </div>
@@ -840,7 +1063,7 @@ export class CaptionDesk extends LitElement {
             <div class="column-head">
               <div>
                 <h2>规则与直播区</h2>
-                <p>确认后进入直播输出；离线内容恢复后统一合并</p>
+                <p>确认后进入直播输出；已播片段可提交勘误，离线内容恢复后统一合并</p>
               </div>
               ${this.model.connection === 'offline'
                 ? html`<cds-button kind="primary" size="sm" @click=${this.mergeOffline}>恢复并合并</cds-button>`
