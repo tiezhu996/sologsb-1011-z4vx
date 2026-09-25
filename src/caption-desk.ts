@@ -4,11 +4,15 @@ import {
   applyRules,
   cloneModel,
   createInitialModel,
+  effectiveText,
+  erratumCount,
   mergeConfirmedSegments,
   normalizeNumbers,
   queueStats,
+  revokeErratum,
   STORAGE_KEY,
   simulateLatency,
+  submitErratum,
   toSrt,
   type CaptionSegment,
   type ConnectionState,
@@ -29,6 +33,17 @@ function formatAge(timestamp: number): string {
   const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
   if (seconds < 60) return `${seconds} 秒前`;
   return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒前`;
+}
+
+function formatDateTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
 }
 
 function stateLabel(state: SegmentState): string {
@@ -217,6 +232,45 @@ export class CaptionDesk extends LitElement {
     .live-item p { margin: 5px 0 0; font-size: var(--caption-font-size); line-height: 1.45; }
     .live-item small { display: block; margin-top: 4px; color: var(--cds-text-secondary, #525252); font-size: 9px; }
     .delivery-status { margin: 0 10px 10px; padding: 9px 10px; background: #edf5ff; border-left: 3px solid #0f62fe; color: #0043ce; font-size: 10px; line-height: 1.45; }
+    .delivery-status.erratum-status { background: #fff1f1; border-left-color: #da1e28; color: #a2191f; }
+
+    .live-item.erratum { border-left-color: #da1e28; background: color-mix(in srgb, var(--cds-layer-02, #f4f4f4) 88%, #ffb3b8 12%); }
+    .live-item.erratum-revoked { border-left-color: #8d8d8d; opacity: .82; }
+    .live-erratum-tag { margin-top: 5px; }
+    .live-current { margin: 5px 0 0; font-size: var(--caption-font-size); line-height: 1.45; }
+    .live-item.erratum .live-current { color: #a2191f; }
+    .live-previous { margin: 4px 0 0; padding: 4px 7px; border-left: 2px solid #8d8d8d; color: var(--cds-text-secondary, #525252); font-size: calc(var(--caption-font-size) * .78); line-height: 1.4; text-decoration: line-through; text-decoration-color: color-mix(in srgb, currentColor 60%, transparent); }
+    .live-previous span { margin-right: 5px; text-decoration: none; font: 600 9px/1 "IBM Plex Mono", monospace; color: #8d8d8d; }
+    .live-item-actions { margin-top: 6px; display: flex; justify-content: flex-end; }
+
+    .erratum-card { border-top: 3px solid #da1e28; }
+    .erratum-active, .erratum-form, .erratum-revoke-box { display: flex; flex-direction: column; gap: 12px; }
+    .erratum-row { display: grid; grid-template-columns: 1fr auto 1fr; gap: 10px; align-items: stretch; }
+    .erratum-cell { padding: 10px 12px; border-radius: 0; display: flex; flex-direction: column; gap: 6px; }
+    .erratum-cell p { margin: 0; font-size: var(--caption-font-size); line-height: 1.5; }
+    .erratum-cell.old { background: #f4f4f4; border-left: 3px solid #8d8d8d; }
+    .erratum-cell.new { background: #fff1f1; border-left: 3px solid #da1e28; }
+    .erratum-cell.new p { color: #a2191f; }
+    .erratum-cell.static { background: var(--cds-layer-02, #f4f4f4); }
+    .erratum-cell-label { font: 600 10px/1.2 "IBM Plex Mono", monospace; letter-spacing: .04em; color: var(--cds-text-secondary, #525252); }
+    .erratum-cell.new .erratum-cell-label { color: #a2191f; }
+    .erratum-arrow { align-self: center; color: #da1e28; font-size: 16px; }
+    .erratum-note { margin: 0; font-size: 12px; line-height: 1.5; }
+    .erratum-meta { margin: 0; color: var(--cds-text-secondary, #525252); font-size: 10px; }
+    .erratum-note-input { min-height: 92px; }
+    .erratum-actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+
+    .erratum-log { border-top: 1px dashed var(--cds-border-subtle, #e0e0e0); padding-top: 10px; }
+    .erratum-log h4 { margin: 0 0 8px; font-size: 11px; color: var(--cds-text-secondary, #525252); }
+    .erratum-log ol { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 7px; }
+    .erratum-log li { padding: 8px 10px; background: var(--cds-layer-02, #f4f4f4); border-left: 2px solid #da1e28; }
+    .erratum-log li.log-revoke { border-left-color: #8d8d8d; }
+    .log-head { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+    .log-head time { color: var(--cds-text-secondary, #525252); font: 500 10px/1 "IBM Plex Mono", monospace; }
+    .erratum-log p { margin: 3px 0 0; font-size: 11px; line-height: 1.45; }
+    .log-old { color: var(--cds-text-secondary, #525252); text-decoration: line-through; text-decoration-color: color-mix(in srgb, currentColor 55%, transparent); }
+    .log-new { color: #a2191f; }
+    .log-note { color: var(--cds-text-primary, #161616); }
 
     .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 20; width: 380px; display: flex; flex-direction: column; gap: 8px; }
     cds-toast-notification { box-shadow: 0 8px 22px rgba(0,0,0,.18); }
@@ -246,6 +300,9 @@ export class CaptionDesk extends LitElement {
   @state() private ruleSpeaker = '';
   @state() private filter: 'active' | 'all' | 'attention' = 'active';
   @state() private showRuleForm = false;
+  @state() private erratumText = '';
+  @state() private erratumNote = '';
+  @state() private erratumMode: 'view' | 'edit' | 'revoke' = 'view';
   private past: DeskModel[] = [];
   private future: DeskModel[] = [];
   private ticker?: number;
@@ -352,8 +409,58 @@ export class CaptionDesk extends LitElement {
   }
 
   private selectSegment(id: string): void {
+    if (id !== this.model.selectedId) this.resetErratumForm();
     this.model = { ...this.model, selectedId: id };
     this.persist();
+  }
+
+  private resetErratumForm(): void {
+    this.erratumText = '';
+    this.erratumNote = '';
+    this.erratumMode = 'view';
+  }
+
+  /** 直播区里直接点“勘误”：用当前直播文本预填，开始写更正说明。 */
+  private startErratum(segment: CaptionSegment): void {
+    this.selectSegment(segment.id);
+    this.erratumText = effectiveText(segment);
+    this.erratumNote = segment.erratum?.active?.note ?? '';
+    this.erratumMode = 'edit';
+  }
+
+  private submitErratumSelected(): void {
+    const selected = this.selected;
+    if (!selected || selected.state !== 'confirmed') {
+      this.pushToast('warning', '只有直播区片段可以勘误', '请先确认片段送入直播区');
+      return;
+    }
+    const text = this.erratumText.trim();
+    const note = this.erratumNote.trim();
+    if (!text || !note) {
+      this.pushToast('warning', '勘误信息不完整', '更正说明和新文本都必须填写');
+      return;
+    }
+    const liveText = selected.erratum?.active?.correctedText ?? selected.corrected;
+    if (text === liveText) {
+      this.pushToast('warning', '新文本与直播内容一致', '没有需要更正的文字变化');
+      return;
+    }
+    const reSubmitting = Boolean(selected.erratum?.active);
+    this.commit('', (current) => submitErratum(current, selected.id, text, note));
+    this.resetErratumForm();
+    this.pushToast(
+      'success',
+      reSubmitting ? '勘误已更新，仅保留最近一次' : '勘误已记录',
+      `第 ${selected.sequence} 段导出字幕将使用更正文本，改前内容保留在勘误记录中`,
+    );
+  }
+
+  private revokeErratumSelected(): void {
+    const selected = this.selected;
+    if (!selected?.erratum?.active) return;
+    this.commit('', (current) => revokeErratum(current, selected.id, this.erratumNote));
+    this.resetErratumForm();
+    this.pushToast('warning', '勘误已撤销', `第 ${selected.sequence} 段恢复改前文本，撤销动作已留在勘误记录`);
   }
 
   private navigate(direction: number): void {
@@ -547,7 +654,13 @@ export class CaptionDesk extends LitElement {
     anchor.download = `${this.model.eventName.replace(/[^\p{L}\p{N}-]+/gu, '-')}.srt`;
     anchor.click();
     URL.revokeObjectURL(url);
-    this.pushToast('success', 'SRT 已导出', `${toSrt(this.model).split('\n\n').length} 段字幕`);
+    const count = this.model.segments.filter((item) => item.state === 'confirmed').length;
+    const errata = erratumCount(this.model);
+    this.pushToast(
+      'success',
+      'SRT 已导出',
+      `${count} 段字幕${errata ? ` · 本场已带 ${errata} 处勘误，导出文本为更正后版本` : '，本场暂无勘误'}`,
+    );
   }
 
   private adjustFont(delta: number): void {
@@ -623,10 +736,140 @@ export class CaptionDesk extends LitElement {
     `;
   }
 
+  private renderErratumHistory(item: CaptionSegment) {
+    const history = item.erratum?.history ?? [];
+    if (!history.length) return nothing;
+    return html`
+      <div class="erratum-log">
+        <h4>勘误记录</h4>
+        <ol>
+          ${[...history].reverse().map((entry) => entry.kind === 'submit' ? html`
+            <li class="log-submit">
+              <div class="log-head"><cds-tag type="red" size="sm">提交勘误</cds-tag><time>${formatDateTime(entry.submittedAt)}</time></div>
+              <p class="log-old">改前：${entry.previousText}</p>
+              <p class="log-new">更正：${entry.correctedText}</p>
+              <p class="log-note">说明：${entry.note}</p>
+            </li>
+          ` : html`
+            <li class="log-revoke">
+              <div class="log-head"><cds-tag type="cool-gray" size="sm">撤销勘误</cds-tag><time>${formatDateTime(entry.revokedAt)}</time></div>
+              <p class="log-old">被撤销的更正：${entry.previousText}</p>
+              <p class="log-note">说明：${entry.note}</p>
+            </li>
+          `)}
+        </ol>
+      </div>
+    `;
+  }
+
+  private renderErratumDesk(item: CaptionSegment) {
+    const active = item.erratum?.active;
+    const mode = active ? this.erratumMode : 'edit';
+    return html`
+      <div class="editor-scroll">
+        <div class="editor-card erratum-card">
+          <div class="editor-top">
+            <div>
+              <div class="editor-time">${formatClock(item.startTime)} — ${formatClock(item.startTime + 7)}</div>
+              <p class="editor-title">直播片段 #${String(item.sequence).padStart(3, '0')} · ${item.speaker} · 已于 ${item.confirmedAt ? formatAge(item.confirmedAt) : '此前'} 播出</p>
+            </div>
+            <div class="editor-status">
+              ${active
+                ? html`<cds-tag type="red" size="sm">已勘误</cds-tag>`
+                : item.erratum?.history.length
+                  ? html`<cds-tag type="cool-gray" size="sm">勘误已撤销</cds-tag>`
+                  : html`<cds-tag type="green" size="sm">直播中</cds-tag>`}
+            </div>
+          </div>
+
+          <div class="editor-form">
+            <cds-inline-notification kind="info" low-contrast title="直播勘误流程"
+              subtitle="该片段已经播出，不能再直接改直播文本。请写明更正说明和新文本，原文、说明与提交时间会留在勘误记录中，回放导出统一使用更正后文本。">
+            </cds-inline-notification>
+
+            ${mode === 'view' && active ? html`
+              <div class="erratum-active">
+                <div class="erratum-row">
+                  <div class="erratum-cell old">
+                    <span class="erratum-cell-label">改前内容（已播出）</span>
+                    <p>${active.previousText}</p>
+                  </div>
+                  <div class="erratum-arrow" aria-hidden="true">→</div>
+                  <div class="erratum-cell new">
+                    <span class="erratum-cell-label">更正后文本（导出用）</span>
+                    <p>${active.correctedText}</p>
+                  </div>
+                </div>
+                <p class="erratum-note"><strong>更正说明：</strong>${active.note}</p>
+                <p class="erratum-meta">提交时间：${formatDateTime(active.submittedAt)} · 同一片段再次提交只保留最近一次，撤销同样留痕。</p>
+                <div class="erratum-actions">
+                  <cds-button kind="secondary" size="sm" @click=${() => this.startErratum(item)}>重新勘误</cds-button>
+                  <cds-button kind="danger--tertiary" size="sm" @click=${() => { this.erratumText = ''; this.erratumNote = ''; this.erratumMode = 'revoke'; }}>撤销勘误</cds-button>
+                </div>
+              </div>
+            ` : nothing}
+
+            ${mode === 'revoke' && active ? html`
+              <div class="erratum-revoke-box">
+                <div class="erratum-cell old static">
+                  <span class="erratum-cell-label">将被撤销的更正文本</span>
+                  <p>${active.correctedText}</p>
+                </div>
+                <cds-textarea
+                  class="erratum-note-input"
+                  label-text="撤销原因（必填，会写入勘误记录）"
+                  helper-text="撤销后该片段恢复改前文本；本次撤销动作与原勘误都会保留。"
+                  .value=${this.erratumNote}
+                  @input=${(event: Event) => { this.erratumNote = (event.currentTarget as any).value; }}
+                ></cds-textarea>
+                <div class="erratum-actions">
+                  <cds-button kind="ghost" size="sm" @click=${this.resetErratumForm}>返回</cds-button>
+                  <cds-button kind="danger--primary" size="sm" @click=${this.revokeErratumSelected}>确认撤销勘误</cds-button>
+                </div>
+              </div>
+            ` : nothing}
+
+            ${mode === 'edit' ? html`
+              <div class="erratum-form">
+                <div class="erratum-cell old static">
+                  <span class="erratum-cell-label">改前内容（直播原文，不可改）</span>
+                  <p>${active?.previousText ?? item.corrected}</p>
+                </div>
+                <cds-textarea
+                  class="caption-input"
+                  label-text="更正后的新文本"
+                  helper-text="导出 SRT 和回放字幕将使用这一文本"
+                  .value=${this.erratumText}
+                  @input=${(event: Event) => { this.erratumText = (event.currentTarget as any).value; }}
+                ></cds-textarea>
+                <cds-textarea
+                  class="erratum-note-input"
+                  label-text="更正说明"
+                  helper-text="写明错在哪里、依据是什么，例如“复核录音，主讲人说的是……”"
+                  .value=${this.erratumNote}
+                  @input=${(event: Event) => { this.erratumNote = (event.currentTarget as any).value; }}
+                ></cds-textarea>
+                <div class="erratum-actions">
+                  ${active ? html`<cds-button kind="ghost" size="sm" @click=${this.resetErratumForm}>取消</cds-button>` : nothing}
+                  <cds-button kind="primary" size="sm" @click=${this.submitErratumSelected}>${active ? '提交更新（仅保留最近一次）' : '提交勘误'}</cds-button>
+                </div>
+              </div>
+            ` : nothing}
+
+            ${this.renderErratumHistory(item)}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   private renderEditor() {
     const item = this.selected;
     if (!item) {
       return html`<div class="empty"><strong>选择一条待确认字幕</strong><p>可以使用 Alt+J / Alt+K 在片段之间移动。</p></div>`;
+    }
+    if (item.state === 'confirmed') {
+      return this.renderErratumDesk(item);
     }
     const applicableRules = this.model.rules.filter((rule) => rule.enabled && (!rule.speaker || rule.speaker === item.speaker));
     return html`
@@ -732,18 +975,34 @@ export class CaptionDesk extends LitElement {
         <section class="inspector-section">
           <div class="inspector-section-head">
             <h3>直播区时间线</h3>
-            <span>${confirmed.length} 段已确认</span>
+            <span>${confirmed.length} 段已确认 · ${erratumCount(this.model)} 处勘误</span>
           </div>
           <div class="live-timeline">
-            ${confirmed.length ? confirmed.slice(-12).reverse().map((segment) => html`
-              <article class="live-item">
+            ${confirmed.length ? confirmed.slice(-12).reverse().map((segment) => {
+              const active = segment.erratum?.active;
+              const revoked = !active && (segment.erratum?.history.length ?? 0) > 0;
+              return html`
+              <article class="live-item ${active ? 'erratum' : ''} ${revoked ? 'erratum-revoked' : ''}">
                 <time>${formatClock(segment.startTime)} · ${segment.speaker}</time>
-                <p>${segment.corrected}</p>
+                ${active ? html`
+                  <cds-tag class="live-erratum-tag" type="red" size="sm">已勘误</cds-tag>
+                  <p class="live-current">${active.correctedText}</p>
+                  <p class="live-previous"><span>改前</span>${active.previousText}</p>
+                  <small>勘误提交于 ${formatDateTime(active.submittedAt)} · ${active.note}</small>
+                ` : html`
+                  ${revoked ? html`<cds-tag class="live-erratum-tag" type="cool-gray" size="sm">勘误已撤销</cds-tag>` : nothing}
+                  <p class="live-current">${segment.corrected}</p>
+                  ${revoked ? html`<small>该片段曾提交勘误后撤销，现按直播原文输出；详情见勘误记录。</small>` : nothing}
+                `}
                 ${segment.source === 'offline' ? html`<small>离线来源 · 恢复后合并</small>` : nothing}
+                <div class="live-item-actions">
+                  <cds-button kind="ghost" size="xs" @click=${() => this.startErratum(segment)}>${active ? '查看/修改勘误' : '提交勘误'}</cds-button>
+                </div>
               </article>
-            `) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
+            `;}) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
           </div>
           ${this.stats.offline > 0 ? html`<div class="delivery-status">离线发件箱有 ${this.stats.offline} 段待合并。恢复连接后按时间顺序提交，不会覆盖已确认内容。</div>` : nothing}
+          ${erratumCount(this.model) > 0 ? html`<div class="delivery-status erratum-status">本场已有 ${erratumCount(this.model)} 处直播勘误：直播区保留改前内容，导出 SRT 统一使用更正后文本。</div>` : nothing}
         </section>
 
         <section class="inspector-section">
@@ -754,8 +1013,15 @@ export class CaptionDesk extends LitElement {
           <div style="padding: 12px; line-height: 1.5; font-size: 11px;">
             ${item ? html`
               <div><strong>原始字幕：</strong>${item.original}</div>
-              <div style="margin-top: 8px;"><strong>修改前校正：</strong>${item.corrected}</div>
-              <div style="margin-top: 8px; color: var(--cds-text-secondary);">${item.tags.length ? `标签：${item.tags.join('、')}` : '尚未应用术语标签'}</div>
+              <div style="margin-top: 8px;"><strong>直播已播出：</strong>${item.corrected}</div>
+              ${item.erratum?.active ? html`
+                <div style="margin-top: 8px; color: #a2191f;"><strong>勘误后导出：</strong>${item.erratum.active.correctedText}</div>
+                <div style="margin-top: 6px; color: var(--cds-text-secondary);">说明：${item.erratum.active.note}（${formatDateTime(item.erratum.active.submittedAt)} 提交）</div>
+              ` : item.erratum?.history.length ? html`
+                <div style="margin-top: 8px; color: var(--cds-text-secondary);">勘误已撤销，导出沿用直播原文；撤销与历次提交见勘误记录。</div>
+              ` : html`
+                <div style="margin-top: 8px; color: var(--cds-text-secondary);">${item.tags.length ? `标签：${item.tags.join('、')}` : '尚未应用术语标签'}</div>
+              `}
             ` : html`<span>请选择片段以查看上下文。</span>`}
           </div>
         </section>

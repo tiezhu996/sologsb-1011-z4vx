@@ -2,6 +2,26 @@ export type ConnectionState = 'connected' | 'degraded' | 'offline';
 export type SegmentState = 'pending' | 'confirmed' | 'duplicate' | 'stale' | 'ignored';
 export type SegmentSource = 'live' | 'offline' | 'manual';
 
+/** 一条勘误提交：原文、更正说明、新文本和提交时间都会留档。 */
+export interface ErratumEntry {
+  previousText: string;
+  note: string;
+  correctedText: string;
+  submittedAt: number;
+}
+
+/**
+ * 片段的勘误记录。同一条片段反复提交时只保留最近一次有效勘误（active），
+ * 被替换的提交和撤销操作都进入 history，保证全程留痕。
+ */
+export interface ErratumRecord {
+  active?: ErratumEntry;
+  history: Array<
+    | ({ kind: 'submit' } & ErratumEntry)
+    | { kind: 'revoke'; previousText: string; note: string; revokedAt: number }
+  >;
+}
+
 export interface CaptionSegment {
   id: string;
   sequence: number;
@@ -18,6 +38,7 @@ export interface CaptionSegment {
   staleReason?: string;
   revision: number;
   tags: string[];
+  erratum?: ErratumRecord;
 }
 
 export interface TermRule {
@@ -83,8 +104,46 @@ function segment(
 }
 
 const seededSegments: CaptionSegment[] = [
-  segment('seg-1', 1, 0, '主持人', '欢迎大家来到二零二六年产品发布会。', '欢迎大家来到2026年产品发布会。', 'confirmed'),
-  segment('seg-2', 2, 7, '主讲人', '今天我们会介绍三个模块,首先是实时协作。', '今天我们会介绍三个模块，首先是实时协作。', 'confirmed'),
+  {
+    ...segment('seg-1', 1, 0, '主持人', '欢迎大家来到二零二六年产品发布会。', '欢迎大家来到2026年产品发布会。', 'confirmed'),
+    erratum: {
+      active: {
+        previousText: '欢迎大家来到2026年产品发布会。',
+        note: '直播口误已播出，应为“春季产品发布会”。',
+        correctedText: '欢迎大家来到2026年春季产品发布会。',
+        submittedAt: now - 70_000,
+      },
+      history: [
+        {
+          kind: 'submit',
+          previousText: '欢迎大家来到2026年产品发布会。',
+          note: '直播口误已播出，应为“春季产品发布会”。',
+          correctedText: '欢迎大家来到2026年春季产品发布会。',
+          submittedAt: now - 70_000,
+        },
+      ],
+    },
+  },
+  {
+    ...segment('seg-2', 2, 7, '主讲人', '今天我们会介绍三个模块,首先是实时协作。', '今天我们会介绍三个模块，首先是实时协作。', 'confirmed'),
+    erratum: {
+      history: [
+        {
+          kind: 'submit',
+          previousText: '今天我们会介绍三个模块，首先是实时协作。',
+          note: '模块数量口误，一度改为“四个模块”，复核录音后维持原文。',
+          correctedText: '今天我们会介绍四个模块，首先是实时协作。',
+          submittedAt: now - 55_000,
+        },
+        {
+          kind: 'revoke',
+          previousText: '今天我们会介绍三个模块，首先是实时协作。',
+          note: '复核现场录音，确认“三个模块”无误，撤销此前勘误。',
+          revokedAt: now - 40_000,
+        },
+      ],
+    },
+  },
   segment('seg-3', 3, 15, '主讲人', '延迟和质量监测会帮助我们保持字幕稳定。', '延迟和质量监测会帮助我们保持字幕稳定。', 'confirmed'),
   segment('seg-4', 4, 24, '嘉宾 / 周然', '我们使用 studio cloud 作为演示环境。', '我们使用 Studio Cloud 作为演示环境。', 'pending'),
   segment('seg-5', 5, 34, '嘉宾 / 周然', '每分钟大约会收到一百二十个片段。', '每分钟大约会收到120个片段。', 'pending'),
@@ -290,6 +349,86 @@ export function simulateLatency(model: DeskModel): DeskModel {
   };
 }
 
+/** 已勘误且未撤销的片段，直播区按此标出“已勘误”。 */
+export function hasActiveErratum(segment: CaptionSegment): boolean {
+  return Boolean(segment.erratum?.active);
+}
+
+/** 直播与导出使用的生效文本：有有效勘误用更正文本，否则用确认文本。 */
+export function effectiveText(segment: CaptionSegment): string {
+  return segment.erratum?.active?.correctedText ?? segment.corrected;
+}
+
+/**
+ * 提交勘误。必须是已进入直播区（confirmed）的片段。
+ * 同一条片段再次提交时替换掉上一条有效勘误，旧提交在 history 中留痕。
+ */
+export function submitErratum(model: DeskModel, segmentId: string, correctedText: string, note: string): DeskModel {
+  const trimmedText = correctedText.trim();
+  const trimmedNote = note.trim();
+  const target = model.segments.find((item) => item.id === segmentId);
+  if (!target || target.state !== 'confirmed' || !trimmedText || !trimmedNote) return model;
+
+  const entry: ErratumEntry = {
+    previousText: target.erratum?.active?.correctedText ?? target.corrected,
+    note: trimmedNote,
+    correctedText: trimmedText,
+    submittedAt: Date.now(),
+  };
+  return {
+    ...model,
+    segments: model.segments.map((item) => {
+      if (item.id !== segmentId) return item;
+      const record: ErratumRecord = {
+        active: entry,
+        history: [...(item.erratum?.history ?? []), { kind: 'submit', ...entry }],
+      };
+      return {
+        ...item,
+        erratum: record,
+        tags: [...new Set([...item.tags.filter((tag) => tag !== '勘误已撤销'), '已勘误'])],
+        revision: item.revision + 1,
+      };
+    }),
+  };
+}
+
+/** 撤销勘误：生效文本回到确认时的原文，但撤销动作本身写入 history 留痕。 */
+export function revokeErratum(model: DeskModel, segmentId: string, revokeNote = ''): DeskModel {
+  const target = model.segments.find((item) => item.id === segmentId);
+  const active = target?.erratum?.active;
+  if (!target || !active) return model;
+
+  return {
+    ...model,
+    segments: model.segments.map((item) => {
+      if (item.id !== segmentId) return item;
+      return {
+        ...item,
+        erratum: {
+          active: undefined,
+          history: [
+            ...(item.erratum?.history ?? []),
+            {
+              kind: 'revoke',
+              previousText: active.correctedText,
+              note: revokeNote.trim() || active.note,
+              revokedAt: Date.now(),
+            },
+          ],
+        },
+        tags: [...new Set([...item.tags.filter((tag) => tag !== '已勘误'), '勘误已撤销'])],
+        revision: item.revision + 1,
+      };
+    }),
+  };
+}
+
+/** 这一场直播目前带有的有效勘误处数。 */
+export function erratumCount(model: DeskModel): number {
+  return model.segments.filter((item) => item.state === 'confirmed' && hasActiveErratum(item)).length;
+}
+
 export function toSrt(model: DeskModel): string {
   const stamp = (seconds: number, separator = ',') => {
     const hours = Math.floor(seconds / 3600);
@@ -301,6 +440,6 @@ export function toSrt(model: DeskModel): string {
   return model.segments
     .filter((item) => item.state === 'confirmed')
     .sort((a, b) => a.startTime - b.startTime)
-    .map((item, index) => `${index + 1}\n${stamp(item.startTime)} --> ${stamp(item.startTime + 7)}\n[${item.speaker}] ${item.corrected}\n`)
+    .map((item, index) => `${index + 1}\n${stamp(item.startTime)} --> ${stamp(item.startTime + 7)}\n[${item.speaker}] ${effectiveText(item)}\n`)
     .join('\n');
 }
